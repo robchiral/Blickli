@@ -1,0 +1,2289 @@
+//! End-to-end test harness. With `BLICKLI_E2E=1`, drives `AppDelegate` step by
+//! step after the initial scan completes, checks state, and exits 0 or 1.
+//! Create the fixture with `scripts/make-fixture.sh`:
+//!
+//!     BLICKLI_E2E=1 cargo run -p blickli --features e2e -- <fixture>
+
+use std::cell::RefCell;
+
+use objc2_app_kit::NSView;
+
+use crate::*;
+
+#[derive(Default)]
+pub struct E2eState {
+    pub step: usize,
+    pub failures: Vec<String>,
+    pub started: bool,
+    /// Ticks the current step has waited, for `hold`.
+    held: u32,
+}
+
+/// Minimal 1×1 two-frame animated GIF (black frame, white frame,
+/// 0.1 s delays) for the animation tests.
+pub const ANIMATED_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, // GIF89a
+    0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, // 1x1, global color table
+    0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, // palette: black, white
+    0x21, 0xF9, 0x04, 0x00, 0x0A, 0x00, 0x00, 0x00, // GCE: 0.1 s
+    0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, // frame 1
+    0x02, 0x02, 0x44, 0x01, 0x00, // pixel 0
+    0x21, 0xF9, 0x04, 0x00, 0x0A, 0x00, 0x00, 0x00, // GCE: 0.1 s
+    0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, // frame 2
+    0x02, 0x02, 0x4C, 0x01, 0x00, // pixel 1
+    0x3B, // trailer
+];
+
+pub fn enabled() -> bool {
+    std::env::var("BLICKLI_E2E").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+#[cfg(feature = "e2e")]
+pub fn is_fixture(path: std::ffi::OsString) -> bool {
+    let path = PathBuf::from(path);
+    std::fs::symlink_metadata(path.join(".blickli-fixture")).is_ok_and(|meta| meta.is_file())
+}
+
+/// Retry the current step for up to `tries` timer ticks while waiting on async
+/// work (watcher events, background transfers).
+fn hold(state: &RefCell<E2eState>, tries: u32) -> bool {
+    let mut state = state.borrow_mut();
+    if state.held < tries {
+        state.held += 1;
+        return true;
+    }
+    false
+}
+
+fn wait_for_count(state: &RefCell<E2eState>, delegate: &AppDelegate, count: usize) -> bool {
+    delegate.e2e_file_count() != count && hold(state, 4)
+}
+
+fn wait_for_transfer(state: &RefCell<E2eState>, delegate: &AppDelegate) -> bool {
+    delegate.e2e_transfer_busy() && hold(state, 4)
+}
+
+fn grow_path(root: &str) -> String {
+    format!("{root}/zzz-grow-{}.heic", std::process::id())
+}
+
+fn check(state: &RefCell<E2eState>, ok: bool, what: &str) {
+    let mut state = state.borrow_mut();
+    let step = state.step;
+    if ok {
+        println!("e2e step {step}: ok: {what}");
+    } else {
+        println!("e2e step {step}: FAIL: {what}");
+        state.failures.push(format!("step {step}: {what}"));
+    }
+}
+
+/// Trigger a menu item via `NSMenu` action dispatch, matching items by title prefix.
+fn perform_menu_item(menu_title: &str, item_title: &str) -> bool {
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return false;
+    };
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    let Some(menubar) = app.mainMenu() else {
+        return false;
+    };
+    for item in menubar.itemArray() {
+        let Some(submenu) = item.submenu() else {
+            continue;
+        };
+        if submenu.title().to_string() != menu_title {
+            continue;
+        }
+        for (index, entry) in submenu.itemArray().iter().enumerate() {
+            if entry.title().to_string().starts_with(item_title) {
+                submenu.performActionForItemAtIndex(index as isize);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn cull_name(tag: &str) -> String {
+    format!("zzz-cull-{}-{tag}.heic", std::process::id())
+}
+
+/// Read-only target directory for failure-message tests.
+fn locked_folder() -> String {
+    std::env::temp_dir()
+        .join(format!("blickli-e2e-locked-{}", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Move/copy target outside the fixture so recursive scans do not pick up transferred files.
+fn transfer_folder() -> String {
+    std::env::temp_dir()
+        .join(format!("blickli-e2e-transfer-{}", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Sibling folder for Finder-open tests (avoids temp dir, which has no sidebar row in sandbox).
+fn open_folder() -> String {
+    let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+    std::path::Path::new(&root)
+        .parent()
+        .expect("the fixture has a parent")
+        .join(format!("blickli-e2e-open-{}", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Temporary file for undo tests, named to sort last and avoid PID collisions.
+fn undo_name() -> String {
+    format!("zzz-undo-{}.heic", std::process::id())
+}
+
+fn transfer_name() -> String {
+    format!("zzz-transfer-{}.heic", std::process::id())
+}
+
+fn snapshot(view: &NSView) -> bool {
+    let bounds = view.bounds();
+    let Some(rep) = view.bitmapImageRepForCachingDisplayInRect(bounds) else {
+        return false;
+    };
+    view.cacheDisplayInRect_toBitmapImageRep(bounds, &rep);
+    rep.pixelsWide() > 0 && rep.pixelsHigh() > 0
+}
+
+/// One step per timer tick, 0.9 s apart so decodes can land.
+pub fn run_step(delegate: &AppDelegate) {
+    let state = delegate.e2e_state();
+    let step = state.borrow().step;
+    match step {
+        0 => {
+            check(state, delegate.e2e_file_count() >= 3, "scan found 3+ files");
+            delegate.start_slideshow(0);
+        }
+        1 => {
+            check(state, delegate.e2e_show_active(), "slideshow window active");
+            check(
+                state,
+                delegate.e2e_current_index() == Some(0),
+                "starts at index 0",
+            );
+            check(
+                state,
+                delegate.e2e_slide_has_image(),
+                "first slide decoded and shown",
+            );
+        }
+        2 => {
+            delegate.step_slideshow(1);
+            check(
+                state,
+                delegate.e2e_current_index() == Some(1),
+                "arrow step to index 1",
+            );
+        }
+        3 => {
+            check(state, delegate.e2e_slide_has_image(), "second slide shown");
+            let drawn = delegate
+                .e2e_slide_view()
+                .is_some_and(|view| snapshot(&view));
+            check(state, drawn, "slide renders to a bitmap");
+        }
+        4 => {
+            delegate.set_auto_advance(Some(0.4));
+        }
+        5 => {} // let the timer run a full harness tick
+        6 => {
+            check(
+                state,
+                delegate.e2e_current_index().is_some_and(|i| i >= 2),
+                "auto-advance moved past index 1",
+            );
+            delegate.set_auto_advance(None);
+            delegate.toggle_overlay();
+        }
+        7 => {
+            check(
+                state,
+                delegate.e2e_overlay_text().is_some_and(|t| !t.is_empty()),
+                "overlay has text",
+            );
+            delegate.end_slideshow();
+        }
+        8 => {
+            check(state, !delegate.e2e_show_active(), "slideshow closed");
+            // Sort round-trip: size-descending puts the biggest file
+            // first, then back to name order.
+            delegate.e2e_sort(blickli_core::SortOrder::Size, true);
+            let first = delegate.e2e_first_file();
+            check(
+                state,
+                first.as_deref() == Some("img10.heic"),
+                "size-descending puts biggest first",
+            );
+            delegate.e2e_sort(blickli_core::SortOrder::Name, false);
+            let first = delegate.e2e_first_file();
+            check(
+                state,
+                first.as_deref() == Some("apple.heic"),
+                "name order restored",
+            );
+        }
+        9 => {
+            let before = delegate.e2e_grid_height();
+            delegate.e2e_scale_cells(1.5);
+            let after = delegate.e2e_grid_height();
+            check(state, after > before, "bigger cells grow the grid");
+            delegate.e2e_scale_cells(1.0 / 1.5);
+        }
+        10 => {
+            // Multi-select: two files selected play just those two.
+            delegate.e2e_select(&[1, 3]);
+            delegate.e2e_start_from_selection();
+            check(
+                state,
+                delegate.e2e_playlist_len() == Some(2),
+                "selection of 2 plays exactly 2",
+            );
+            delegate.end_slideshow();
+        }
+        11 => {
+            // Watcher: a new file appears on disk.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let src = format!("{root}/img2.heic");
+            let dst = format!("{root}/zzz-watcher-test.heic");
+            let copied = std::fs::copy(&src, &dst).is_ok();
+            check(state, copied, "test file copied");
+        }
+        12 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher picked up the new file",
+            );
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let _ = std::fs::remove_file(format!("{root}/zzz-watcher-test.heic"));
+        }
+        13 => {
+            if wait_for_count(state, delegate, 4) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "watcher removed the deleted file",
+            );
+        }
+        14 => {
+            // Rotation + per-file state memory.
+            delegate.start_slideshow(0);
+        }
+        15 => {
+            if let Some(view) = delegate.e2e_slide_view() {
+                view.rotate(90);
+                check(state, view.state().rotation == 90, "rotate key turns 90");
+            }
+            // Slide context menu matches grid menu minus "Start Slideshow".
+            let titles: Vec<String> = delegate
+                .e2e_slide_context_menu()
+                .into_iter()
+                .map(|(title, _)| title)
+                .collect();
+            check(
+                state,
+                titles.iter().any(|t| t == "Move to Trash")
+                    && titles.iter().any(|t| t == "Reveal in Finder")
+                    && titles.iter().any(|t| t.starts_with("Copy to"))
+                    && !titles.iter().any(|t| t == "Start Slideshow")
+                    && titles.first().is_some_and(|t| !t.is_empty()),
+                "slide context menu matches grid menu without 'Start Slideshow'",
+            );
+            // The info panel floats over a slideshow; the
+            // slide window is at the normal level, the panel above it.
+            delegate.e2e_toggle_info();
+            let windows = delegate.e2e_window_order();
+            let info = windows.iter().find(|(title, _, _)| title == "Info");
+            let slide = windows.iter().find(|(title, _, _)| title == "apple.heic");
+            check(
+                state,
+                match (info, slide) {
+                    (Some((_, info_level, info_order)), Some((_, slide_level, slide_order))) => {
+                        info_level > slide_level && info_order < slide_order
+                    }
+                    _ => false,
+                },
+                "the info panel sits over a slideshow",
+            );
+            delegate.e2e_toggle_info();
+            delegate.step_slideshow(1);
+        }
+        16 => {
+            if let Some(view) = delegate.e2e_slide_view() {
+                check(
+                    state,
+                    view.state().rotation == 0,
+                    "next slide starts unrotated",
+                );
+            }
+            delegate.step_slideshow(-1);
+        }
+        17 => {
+            if let Some(view) = delegate.e2e_slide_view() {
+                check(
+                    state,
+                    view.state().rotation == 90,
+                    "rotation remembered per file",
+                );
+            }
+            delegate.end_slideshow();
+        }
+        18 => {
+            check(state, !delegate.e2e_show_active(), "slideshow closed");
+            check(
+                state,
+                delegate.e2e_selected_name().as_deref() == Some("apple.heic"),
+                "the last slide is the active thumbnail",
+            );
+            // Windowed slideshow.
+            delegate.start_slideshow(0);
+        }
+        19 => {
+            check(
+                state,
+                delegate.e2e_show_active(),
+                "windowed slideshow active",
+            );
+            check(
+                state,
+                delegate.e2e_show_is_windowed() == Some(true),
+                "window has a title bar",
+            );
+            check(
+                state,
+                delegate.e2e_slide_has_image(),
+                "windowed slide shown",
+            );
+            // Zoom holds the image point under the anchor. Anchored
+            // a quarter-width right of the centre, doubling the scale
+            // from fit has to pull the pan left by that same quarter.
+            if let Some(view) = delegate.e2e_slide_view() {
+                let bounds = view.bounds();
+                let (cx, cy) = (
+                    bounds.origin.x + bounds.size.width / 2.0,
+                    bounds.origin.y + bounds.size.height / 2.0,
+                );
+                let step = bounds.size.width / 4.0;
+                let fit = view.drawn_scale();
+                view.zoom_to(
+                    fit * 2.0,
+                    Some(objc2_core_foundation::CGPoint::new(cx + step, cy)),
+                );
+                let (dx, dy) = view.state().offset;
+                check(
+                    state,
+                    (dx + step).abs() < 0.01 && dy.abs() < 0.01,
+                    "zoom holds the point under the pointer",
+                );
+                // Back to the fitting scale: fit again, pan cleared.
+                view.zoom_to(fit, None);
+                check(
+                    state,
+                    view.state().zoom.is_none() && view.state().offset == (0.0, 0.0),
+                    "zooming back out lands on fit, with the pan cleared",
+                );
+            }
+            delegate.end_slideshow();
+        }
+        20 => {
+            check(state, !delegate.e2e_show_active(), "windowed show closed");
+            check(
+                state,
+                perform_menu_item("Slideshow", "Start Slideshow"),
+                "menu item 'Start Slideshow' fired",
+            );
+        }
+        21 => {
+            check(
+                state,
+                delegate.e2e_show_is_windowed() == Some(true),
+                "the slideshow has a title bar",
+            );
+        }
+        22 => {
+            check(
+                state,
+                delegate.e2e_slideshow_windows() == 1,
+                "the menu opened one slideshow window",
+            );
+        }
+        23 => {
+            delegate.end_slideshow();
+        }
+        24 => {
+            check(
+                state,
+                !delegate.e2e_show_active(),
+                "menu-started show closed",
+            );
+        }
+        25 => {
+            // Status bar: count, then selection info.
+            delegate.e2e_select(&[]);
+            check(
+                state,
+                delegate.e2e_status_text().contains("4 images"),
+                "status shows the image count",
+            );
+            delegate.e2e_select(&[1, 3]);
+            check(
+                state,
+                delegate.e2e_status_text().contains("2 of 4 selected"),
+                "status shows the selection",
+            );
+            delegate.e2e_select(&[1]);
+            let text = delegate.e2e_status_text();
+            check(
+                state,
+                text.contains("×") && text.contains("B"),
+                "single selection shows dimensions and size",
+            );
+            delegate.e2e_select(&[]);
+        }
+        26 => {
+            // Filename labels grow the rows.
+            let before = delegate.e2e_grid_height();
+            delegate.e2e_toggle_labels();
+            check(
+                state,
+                delegate.e2e_grid_height() > before,
+                "labels add row height",
+            );
+            delegate.e2e_toggle_labels();
+        }
+        28 => {
+            // Animated GIF: drop one into the folder for the watcher.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let written = std::fs::write(format!("{root}/zzz-anim.gif"), ANIMATED_GIF).is_ok();
+            check(state, written, "animated gif written");
+        }
+        29 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher picked up the gif",
+            );
+            // Name order puts zzz-anim.gif last: index 4.
+            delegate.start_slideshow(4);
+        }
+        30 => {
+            check(state, delegate.e2e_show_active(), "gif slideshow active");
+            check(
+                state,
+                delegate.e2e_slide_animating(),
+                "gif frames are playing",
+            );
+            delegate.end_slideshow();
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let _ = std::fs::remove_file(format!("{root}/zzz-anim.gif"));
+        }
+        31 => {
+            if wait_for_count(state, delegate, 4) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "gif removed after the test",
+            );
+        }
+        32 => {
+            // Sidebar: open the tree down to the fixture folder and
+            // click it, the same path a user click takes.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            delegate.e2e_sidebar_click(&root);
+            check(
+                state,
+                delegate.e2e_sidebar_path().ends_with(
+                    std::path::Path::new(&root)
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                ),
+                "sidebar highlights the folder it opened",
+            );
+        }
+        33 => {
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "sidebar click rescanned the folder",
+            );
+            delegate.e2e_toggle_sidebar();
+            check(state, delegate.e2e_sidebar_hidden(), "sidebar collapses");
+            delegate.e2e_toggle_sidebar();
+            check(state, !delegate.e2e_sidebar_hidden(), "sidebar shows again");
+            // Favorites: three seeded, one added, one removed.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let before = delegate.e2e_favorite_count();
+            delegate.e2e_add_favorite(&root);
+            check(
+                state,
+                delegate.e2e_favorite_count() == before + 1,
+                "folder joins the favorites",
+            );
+            delegate.e2e_remove_favorite(&root);
+            check(
+                state,
+                delegate.e2e_favorite_count() == before,
+                "favorite goes away again",
+            );
+        }
+        34 => {
+            delegate.show_prefs();
+            check(state, delegate.e2e_prefs_visible(), "prefs window opens");
+            delegate.e2e_close_prefs();
+            check(state, !delegate.e2e_prefs_visible(), "prefs window closes");
+        }
+        27 => {
+            // Date sort orders: the fixture has no EXIF dates, so
+            // both fall back to the modified date without breaking
+            // the grid; then name order restores.
+            delegate.e2e_sort(blickli_core::SortOrder::ExifDate, true);
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "EXIF date sort keeps all files",
+            );
+            delegate.e2e_sort(blickli_core::SortOrder::Added, true);
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "date added sort keeps all files",
+            );
+            delegate.e2e_sort(blickli_core::SortOrder::Name, false);
+            check(
+                state,
+                delegate.e2e_first_file().as_deref() == Some("apple.heic"),
+                "name order restored after date sorts",
+            );
+        }
+        35 => {
+            // Trash from the grid: cull a copy, not a fixture file.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let copied = std::fs::copy(
+                format!("{root}/img2.heic"),
+                format!("{root}/{}", cull_name("a")),
+            )
+            .is_ok();
+            check(state, copied, "cull test file copied");
+        }
+        36 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher saw the cull test file",
+            );
+            // Name order puts the cull file last: index 4.
+            delegate.e2e_select(&[4]);
+            check(
+                state,
+                perform_menu_item("File", "Move to Trash"),
+                "menu item 'Move to Trash' fired",
+            );
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "trashed image left the grid",
+            );
+            check(
+                state,
+                delegate.e2e_status_text() == format!("Moved to Trash: {}", cull_name("a")),
+                "status bar names the trashed file",
+            );
+            check(
+                state,
+                delegate.e2e_selected_name().as_deref() == Some("img10.heic"),
+                "trashing the last image selects the previous one",
+            );
+        }
+        37 => {
+            // Watcher echo of our own delete must not overwrite the status message.
+            check(
+                state,
+                delegate.e2e_status_text() == format!("Moved to Trash: {}", cull_name("a")),
+                "watcher echo preserves the status message",
+            );
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let copied = std::fs::copy(
+                format!("{root}/img2.heic"),
+                format!("{root}/{}", cull_name("b")),
+            )
+            .is_ok();
+            check(state, copied, "second cull test file copied");
+        }
+        38 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher saw the second file",
+            );
+            delegate.start_slideshow(4);
+            check(
+                state,
+                perform_menu_item("File", "Move to Trash"),
+                "menu item 'Move to Trash' fired during slideshow",
+            );
+            check(
+                state,
+                delegate.e2e_show_active(),
+                "slideshow stays open after trashing a slide",
+            );
+            check(
+                state,
+                delegate.e2e_playlist_len() == Some(4),
+                "trashed slide removed from playlist",
+            );
+            check(
+                state,
+                delegate
+                    .e2e_overlay_text()
+                    .is_some_and(|t| t == format!("Moved to Trash: {}", cull_name("b"))),
+                "slide overlay names the trashed file",
+            );
+            delegate.end_slideshow();
+        }
+        39 => {
+            if wait_for_count(state, delegate, 4) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "grid back to the fixture",
+            );
+        }
+        40 => {
+            // Move and copy: a test file of our own, into a folder
+            // outside the fixture.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let made = std::fs::create_dir_all(transfer_folder()).is_ok();
+            let copied = std::fs::copy(
+                format!("{root}/img2.heic"),
+                format!("{root}/{}", transfer_name()),
+            )
+            .is_ok();
+            check(state, made && copied, "transfer test folder and file ready");
+        }
+        41 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher saw the transfer file",
+            );
+            // Name order puts the zzz file last: index 4.
+            delegate.e2e_select(&[4]);
+            delegate.e2e_transfer(&transfer_folder(), true);
+        }
+        42 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
+            check(state, !delegate.e2e_transfer_busy(), "the batch finished");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "moved image left the grid",
+            );
+            check(
+                state,
+                std::path::Path::new(&format!("{}/{}", transfer_folder(), transfer_name()))
+                    .exists(),
+                "moved image arrived in the target folder",
+            );
+            let folder_name = std::path::Path::new(&transfer_folder())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            check(
+                state,
+                delegate.e2e_status_text() == format!("Moved {} to {folder_name}", transfer_name()),
+                "status bar names the moved file and its folder",
+            );
+            check(
+                state,
+                delegate.e2e_repeat_item_title(true) == format!("Move Again to {folder_name}"),
+                "repeat item names the last folder",
+            );
+            check(
+                state,
+                delegate.e2e_selected_name().as_deref() == Some("img10.heic"),
+                "move advances selection like trash",
+            );
+            // Copy a second file with the same name to test collision numbering.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let _ = std::fs::copy(
+                format!("{root}/img2.heic"),
+                format!("{root}/{}", transfer_name()),
+            );
+        }
+        43 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher saw the second file",
+            );
+            delegate.e2e_select(&[4]);
+            check(
+                state,
+                perform_menu_item("File", "Move Again"),
+                "menu item 'Move Again' fired",
+            );
+        }
+        44 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "second move left the grid",
+            );
+            let stem_now = transfer_name().trim_end_matches(".heic").to_string();
+            check(
+                state,
+                delegate
+                    .e2e_status_text()
+                    .contains(&format!("{stem_now} 2.heic"))
+                    && delegate.e2e_status_text().ends_with(", 1 renamed"),
+                "status bar names the file by its new name and reports the rename",
+            );
+            let stem = transfer_name().trim_end_matches(".heic").to_string();
+            check(
+                state,
+                std::path::Path::new(&format!("{}/{stem} 2.heic", transfer_folder())).exists(),
+                "the collision kept both files",
+            );
+            // Copy leaves the grid alone.
+            delegate.e2e_select(&[0]);
+            delegate.e2e_transfer(&transfer_folder(), false);
+        }
+        45 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "a copy leaves the grid alone",
+            );
+            check(
+                state,
+                std::path::Path::new(&format!("{}/apple.heic", transfer_folder())).exists(),
+                "copied image arrived in the target folder",
+            );
+            check(
+                state,
+                delegate
+                    .e2e_status_text()
+                    .starts_with("Copied apple.heic to "),
+                "status bar names the copied file",
+            );
+            // Two files at once, to check the batch line and that
+            // the grid loses both.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            for tag in ["m1", "m2"] {
+                let _ = std::fs::copy(
+                    format!("{root}/img1.heic"),
+                    format!("{root}/zzz-{tag}-{}.heic", std::process::id()),
+                );
+            }
+        }
+        46 => {
+            if wait_for_count(state, delegate, 6) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 6,
+                "watcher saw both batch files",
+            );
+            delegate.e2e_select(&[4, 5]);
+            delegate.e2e_transfer(&transfer_folder(), true);
+        }
+        47 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
+            check(
+                state,
+                !delegate.e2e_transfer_busy(),
+                "the two-file batch finished",
+            );
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "the batch left the grid",
+            );
+            let folder_name = std::path::Path::new(&transfer_folder())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            check(
+                state,
+                delegate.e2e_status_text() == format!("Moved 2 images to {folder_name}"),
+                "status bar counts a batch",
+            );
+            let _ = std::fs::remove_dir_all(transfer_folder());
+        }
+        48 => {
+            // Filter: the bar opens, typing narrows the grid, and the
+            // grid that is left is the grid.
+            delegate.e2e_open_filter();
+            check(state, delegate.e2e_filter_open(), "the filter bar opens");
+            delegate.e2e_type_filter("img1");
+            check(
+                state,
+                delegate.e2e_file_count() == 2,
+                "the filter narrows the grid to the matches",
+            );
+            check(
+                state,
+                delegate.e2e_status_text().ends_with("2 of 4 images"),
+                "status bar counts what is hidden",
+            );
+        }
+        49 => {
+            // Case is ignored, and select-all takes the matches only.
+            delegate.e2e_type_filter("IMG1");
+            check(
+                state,
+                delegate.e2e_file_count() == 2,
+                "the filter ignores case",
+            );
+            delegate.e2e_select_all();
+            check(
+                state,
+                delegate.e2e_status_text().starts_with("2 of 2 selected"),
+                "select all takes the matches only",
+            );
+            check(
+                state,
+                delegate.e2e_playlist_len().is_none(),
+                "no slideshow is running yet",
+            );
+            delegate.e2e_start_from_selection();
+        }
+        50 => {
+            check(
+                state,
+                delegate.e2e_playlist_len() == Some(2),
+                "a slideshow plays the matches only",
+            );
+            delegate.end_slideshow();
+            delegate.e2e_close_filter();
+        }
+        51 => {
+            check(state, !delegate.e2e_filter_open(), "escape closes the bar");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "closing the bar brings the folder back",
+            );
+            // A new folder starts unfiltered.
+            delegate.e2e_open_filter();
+            delegate.e2e_type_filter("img1");
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            delegate.e2e_sidebar_click(&root);
+        }
+        52 => {
+            check(
+                state,
+                !delegate.e2e_filter_open(),
+                "a folder change closes the bar",
+            );
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "a folder change clears the filter",
+            );
+        }
+        53 => {
+            // New files show up only when they match.
+            delegate.e2e_open_filter();
+            delegate.e2e_type_filter("img1");
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let pid = std::process::id();
+            let matching = std::fs::copy(
+                format!("{root}/img1.heic"),
+                format!("{root}/img1-extra-{pid}.heic"),
+            )
+            .is_ok();
+            let other = std::fs::copy(
+                format!("{root}/img2.heic"),
+                format!("{root}/zzz-hidden-{pid}.heic"),
+            )
+            .is_ok();
+            check(state, matching && other, "two more files copied in");
+        }
+        54 => {
+            if wait_for_count(state, delegate, 3) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 3,
+                "only the matching new file joins the grid",
+            );
+            check(
+                state,
+                delegate.e2e_status_text().ends_with("3 of 6 images"),
+                "the count knows about the hidden file",
+            );
+            delegate.e2e_close_filter();
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let pid = std::process::id();
+            let _ = std::fs::remove_file(format!("{root}/img1-extra-{pid}.heic"));
+            let _ = std::fs::remove_file(format!("{root}/zzz-hidden-{pid}.heic"));
+        }
+        55 => {
+            if wait_for_count(state, delegate, 4) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "grid back to the fixture",
+            );
+        }
+        56 => {
+            // Finder open: a file in the folder already showing.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            // A show is up and a filter is on, so the open has to
+            // clear both to leave the grid visible.
+            delegate.start_slideshow(0);
+            delegate.e2e_open_filter();
+            delegate.e2e_type_filter("apple");
+            delegate.open_from_finder(vec![std::path::PathBuf::from(format!("{root}/img2.heic"))]);
+            check(
+                state,
+                delegate.e2e_selected_name().as_deref() == Some("img2.heic"),
+                "an opened image is selected in the grid",
+            );
+            check(
+                state,
+                delegate.e2e_show_active()
+                    && delegate.e2e_slide_name().as_deref() == Some("img2.heic"),
+                "an opened image starts a slideshow",
+            );
+            check(
+                state,
+                !delegate.e2e_filter_open() && delegate.e2e_file_count() == 4,
+                "opening an image clears a filter that would hide it",
+            );
+        }
+        57 => {
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            delegate.open_from_finder(vec![
+                std::path::PathBuf::from(format!("{root}/img1.heic")),
+                std::path::PathBuf::from(format!("{root}/img2.heic")),
+            ]);
+            check(
+                state,
+                delegate.e2e_status_text().starts_with("2 of 4 selected"),
+                "two opened images are both selected",
+            );
+            // A file in another folder: the grid follows it there.
+            let _ = std::fs::create_dir_all(open_folder());
+            let _ = std::fs::copy(
+                format!("{root}/apple.heic"),
+                format!("{}/apple.heic", open_folder()),
+            );
+            delegate.open_from_finder(vec![std::path::PathBuf::from(format!(
+                "{}/apple.heic",
+                open_folder()
+            ))]);
+        }
+        58 => {
+            if wait_for_count(state, delegate, 1) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 1,
+                "opening a file elsewhere scans its folder",
+            );
+            check(
+                state,
+                delegate.e2e_selected_name().as_deref() == Some("apple.heic"),
+                "the opened image is selected once the scan lands",
+            );
+            check(
+                state,
+                delegate.e2e_sidebar_path().ends_with(
+                    std::path::Path::new(&open_folder())
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                ),
+                "the sidebar follows the opened image's folder",
+            );
+            // A folder opens as a folder.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            delegate.open_from_finder(vec![std::path::PathBuf::from(root)]);
+        }
+        59 => {
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "opening a folder shows that folder",
+            );
+            let _ = std::fs::remove_dir_all(open_folder());
+        }
+        60 => {
+            // Right-click a cell outside the selection: it takes that
+            // cell, Finder style.
+            delegate.e2e_select(&[0]);
+            let first = delegate.e2e_selected_name();
+            let menu = delegate.e2e_grid_context_menu(2);
+            let taken = delegate.e2e_selected_name();
+            check(
+                state,
+                taken.is_some()
+                    && taken != first
+                    && delegate
+                        .e2e_status_text()
+                        .starts_with(taken.as_deref().unwrap_or_default()),
+                "right-click outside the selection takes the cell under the pointer",
+            );
+            let titles: Vec<String> = menu.iter().map(|(title, _)| title.clone()).collect();
+            check(
+                state,
+                titles.iter().any(|t| t == "Start Slideshow")
+                    && titles.iter().any(|t| t == "Reveal in Finder")
+                    && titles.iter().any(|t| t == "Move to…")
+                    && titles.iter().any(|t| t == "Copy to…")
+                    && titles.iter().any(|t| t == "Move to Trash"),
+                "grid menu includes slideshow, reveal, transfer, and trash actions",
+            );
+            check(
+                state,
+                titles.iter().any(|t| t.starts_with("Move Again to ")),
+                "grid menu shows last move destination",
+            );
+            check(
+                state,
+                menu.iter()
+                    .any(|(title, enabled)| title == "Move to Trash" && *enabled),
+                "Move to Trash is enabled with active selection",
+            );
+        }
+        61 => {
+            // Right-click inside selection preserves multi-selection.
+            delegate.e2e_select(&[0, 1]);
+            delegate.e2e_grid_context_menu(1);
+            check(
+                state,
+                delegate.e2e_status_text().starts_with("2 of 4 selected"),
+                "right-click inside selection preserves it",
+            );
+        }
+        62 => {
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let titles = delegate.e2e_sidebar_context_menu(&root);
+            check(
+                state,
+                titles.first().map(String::as_str) == Some("This Folder Only")
+                    && titles.last().map(String::as_str) == Some("Open in Finder"),
+                "sidebar menu offers single-folder view and Open in Finder",
+            );
+            check(
+                state,
+                titles.iter().any(|t| t == "Add to Favorites"),
+                "non-favorite folder offers Add to Favorites",
+            );
+            delegate.e2e_add_favorite(&root);
+            let titles = delegate.e2e_sidebar_context_menu(&root);
+            check(
+                state,
+                titles.iter().any(|t| t == "Remove from Favorites"),
+                "favorite folder offers Remove from Favorites",
+            );
+            delegate.e2e_remove_favorite(&root);
+        }
+        63 => {
+            // A folder dragged into Favorites lands in the gap it was
+            // dropped in, and dragging one that is already there moves
+            // it instead of doubling it.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let before = delegate.e2e_favorite_count();
+            delegate.e2e_insert_favorite(&root, 0);
+            let names = delegate.e2e_favorite_names();
+            check(
+                state,
+                delegate.e2e_favorite_count() == before + 1
+                    && names.first().map(String::as_str)
+                        == std::path::Path::new(&root)
+                            .file_name()
+                            .and_then(|n| n.to_str()),
+                "a folder dropped at the top of Favorites lands there",
+            );
+            delegate.e2e_insert_favorite(&root, 3);
+            let names = delegate.e2e_favorite_names();
+            check(
+                state,
+                delegate.e2e_favorite_count() == before + 1
+                    && names.first().map(String::as_str)
+                        != std::path::Path::new(&root)
+                            .file_name()
+                            .and_then(|n| n.to_str()),
+                "dropping it again moves it instead of adding a second row",
+            );
+            delegate.e2e_remove_favorite(&root);
+            check(
+                state,
+                delegate.e2e_favorite_count() == before,
+                "Favorites is back to what it was",
+            );
+        }
+        64 => {
+            // The info panel reads the same images an action would
+            // work on, and says so in full for one image.
+            delegate.e2e_select(&[0]);
+            let text = delegate.e2e_info_text();
+            let name = delegate.e2e_selected_name().unwrap_or_default();
+            check(
+                state,
+                text.contains(&name) && text.contains("Dimensions") && text.contains("Size"),
+                "the info panel names the one selected image and its dimensions",
+            );
+            delegate.e2e_select(&[0, 1]);
+            check(
+                state,
+                delegate.e2e_info_text().contains("2 images"),
+                "several selected images come back as a count",
+            );
+            let on_disk: u64 = delegate
+                .action_targets()
+                .iter()
+                .filter_map(|path| std::fs::metadata(path).ok())
+                .map(|meta| meta.len())
+                .sum();
+            check(
+                state,
+                delegate
+                    .e2e_info_text()
+                    .contains(&blickli_core::messages::format_bytes(on_disk)),
+                "their size is the size on disk",
+            );
+            delegate.e2e_select(&[]);
+            check(
+                state,
+                delegate.e2e_info_text() == "No image selected.",
+                "nothing selected says so",
+            );
+            delegate.e2e_toggle_info();
+            check(state, delegate.e2e_info_open(), "cmd-I opens the panel");
+            delegate.e2e_toggle_info();
+            check(
+                state,
+                !delegate.e2e_info_open(),
+                "a second cmd-I puts it away",
+            );
+        }
+        65 => {
+            // The overlay's extra blocks, on top of a running show.
+            delegate.e2e_select(&[0]);
+            delegate.start_slideshow(0);
+        }
+        66 => {
+            delegate.e2e_toggle_path_overlay();
+            let text = delegate.e2e_overlay_text().unwrap_or_default();
+            check(
+                state,
+                text.lines().count() >= 2 && text.contains("blickli-e2e-fixture"),
+                "p adds the full path under the usual line",
+            );
+            delegate.e2e_toggle_exif_overlay();
+            let text = delegate.e2e_overlay_text().unwrap_or_default();
+            check(
+                state,
+                text.contains("Dimensions"),
+                "shift-I adds what the file header holds",
+            );
+            delegate.e2e_toggle_help_overlay();
+            let text = delegate.e2e_overlay_text().unwrap_or_default();
+            check(
+                state,
+                text.starts_with("Slideshow keys"),
+                "h takes the overlay over with the cheat sheet",
+            );
+            delegate.e2e_toggle_help_overlay();
+            delegate.e2e_toggle_exif_overlay();
+            delegate.e2e_toggle_path_overlay();
+            let text = delegate.e2e_overlay_text().unwrap_or_default();
+            check(
+                state,
+                text.lines().count() == 1 && text.contains("/"),
+                "turning the blocks off leaves the usual line alone",
+            );
+            // Page down walks ten slides, or as far as the folder goes.
+            delegate.jump_slideshow(10);
+            check(
+                state,
+                delegate.e2e_current_index() == Some(3),
+                "a page jump stops at the last slide",
+            );
+            delegate.end_slideshow();
+        }
+        67 => {
+            // Handing an image to something else: the app list, and
+            // the clipboard.
+            delegate.e2e_select(&[0]);
+            let apps = delegate.e2e_open_with_names();
+            check(
+                state,
+                !apps.is_empty(),
+                "the open with menu lists the apps that can open the image",
+            );
+            delegate.e2e_copy_path(false);
+            let copied = delegate.e2e_pasteboard_text();
+            check(
+                state,
+                copied.contains("blickli-e2e-fixture") && !copied.starts_with("file:"),
+                "copy path puts the plain path on the clipboard",
+            );
+            check(
+                state,
+                delegate.e2e_status_text().starts_with("Copied path"),
+                "status bar confirms path copy",
+            );
+            delegate.e2e_select(&[0, 1]);
+            delegate.e2e_copy_path(true);
+            let copied = delegate.e2e_pasteboard_text();
+            check(
+                state,
+                copied.lines().count() == 2 && copied.starts_with("file:"),
+                "several images copy as one file URL per line",
+            );
+            let back: Vec<std::path::PathBuf> = copied
+                .lines()
+                .filter_map(|line| NSURL::URLWithString(&NSString::from_str(line)))
+                .filter_map(|url| url.to_file_path())
+                .collect();
+            check(
+                state,
+                back == delegate.action_targets(),
+                "each file URL leads back to its image",
+            );
+        }
+        68 => {
+            // Undo, on a file of our own so the fixture survives.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let _ = std::fs::copy(
+                format!("{root}/img2.heic"),
+                format!("{root}/{}", undo_name()),
+            );
+        }
+        69 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher saw the undo test file",
+            );
+            // Name order puts zzz-undo last.
+            delegate.e2e_select(&[4]);
+            check(
+                state,
+                perform_menu_item("File", "Move to Trash"),
+                "menu item 'Move to Trash' fired",
+            );
+            check(
+                state,
+                delegate.e2e_undo_title() == "Undo move to Trash",
+                "Edit menu reflects undo action",
+            );
+            check(
+                state,
+                !std::path::Path::new(&format!("{root}/{}", undo_name())).exists(),
+                "trashed file left the folder",
+            );
+            delegate.e2e_undo();
+            check(
+                state,
+                std::path::Path::new(&format!("{root}/{}", undo_name())).exists(),
+                "undo restored the trashed file",
+            );
+            check(
+                state,
+                delegate.e2e_redo_title() == "Redo move to Trash",
+                "Edit menu reflects redo action",
+            );
+        }
+        70 => {
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "the restored file is in the grid",
+            );
+            delegate.e2e_redo();
+            check(
+                state,
+                !std::path::Path::new(&format!("{root}/{}", undo_name())).exists(),
+                "redo culled it again",
+            );
+            // Undo once more, then move it away and undo that too.
+            delegate.e2e_undo();
+        }
+        71 => {
+            let _ = std::fs::create_dir_all(transfer_folder());
+            delegate.e2e_select(&[4]);
+            delegate.e2e_transfer(&transfer_folder(), true);
+        }
+        72 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            check(
+                state,
+                std::path::Path::new(&format!("{}/{}", transfer_folder(), undo_name())).exists(),
+                "the file moved to the target folder",
+            );
+            delegate.e2e_undo();
+            check(
+                state,
+                std::path::Path::new(&format!("{root}/{}", undo_name())).exists()
+                    && !std::path::Path::new(&format!("{}/{}", transfer_folder(), undo_name()))
+                        .exists(),
+                "undo walked the move back",
+            );
+            let _ = std::fs::remove_file(format!("{root}/{}", undo_name()));
+            let _ = std::fs::remove_dir_all(transfer_folder());
+        }
+        73 => {
+            // Thumbnail size: the ceiling holds, and the slider reads
+            // what the grid settled on.
+            delegate.e2e_thumb_cap(160.0);
+            delegate.e2e_scale_cells(4.0);
+            check(
+                state,
+                delegate.e2e_thumb_size() == 160.0,
+                "cells stop at the size the preference allows",
+            );
+            check(
+                state,
+                delegate.e2e_slider_value() == delegate.e2e_thumb_size(),
+                "the slider reads what the grid settled on",
+            );
+            delegate.e2e_thumb_cap(512.0);
+            delegate.e2e_scale_cells(4.0);
+            check(
+                state,
+                delegate.e2e_thumb_size() > 160.0,
+                "raising the ceiling lets them grow again",
+            );
+            delegate.e2e_thumb_cap(160.0);
+            check(
+                state,
+                delegate.e2e_thumb_size() == 160.0,
+                "lowering it brings oversized cells back down",
+            );
+            delegate.e2e_thumb_cap(320.0);
+            delegate.e2e_scale_cells(0.001);
+            check(
+                state,
+                delegate.e2e_thumb_size() == 60.0,
+                "and they stop at the small end too",
+            );
+        }
+        74 => {
+            // No shortcut may be bound twice.
+            let clashes = delegate.e2e_menu_conflicts();
+            if !clashes.is_empty() {
+                for clash in &clashes {
+                    println!("e2e menu clash: {clash}");
+                }
+            }
+            check(
+                state,
+                clashes.is_empty(),
+                "every menu shortcut is bound once",
+            );
+        }
+        75 => {
+            // The preference that keeps a drag onto the desktop from
+            // emptying the folder.
+            check(
+                state,
+                !delegate.e2e_drag_copies(),
+                "a drag out moves by default, the way Finder does",
+            );
+            delegate.e2e_toggle_drag_copies();
+            check(
+                state,
+                delegate.e2e_drag_copies(),
+                "the setting turns a drag out into a copy",
+            );
+            delegate.e2e_toggle_drag_copies();
+            check(state, !delegate.e2e_drag_copies(), "and back again");
+        }
+        76 => {
+            // A small image sits at its own size until the preference
+            // says to fill the window with it.
+            delegate.e2e_select(&[0]);
+            delegate.start_slideshow(0);
+        }
+        77 => {
+            check(
+                state,
+                delegate.e2e_slide_scale() <= 1.0,
+                "a small slide is drawn no larger than itself",
+            );
+            delegate.e2e_toggle_scale_up();
+            check(
+                state,
+                delegate.e2e_scale_up() && delegate.e2e_slide_scale() > 1.0,
+                "the setting fills the window with it",
+            );
+            delegate.e2e_toggle_scale_up();
+            check(
+                state,
+                delegate.e2e_slide_scale() <= 1.0,
+                "and turning it off puts it back",
+            );
+            delegate.end_slideshow();
+        }
+        78 => {
+            // Copy puts the files themselves on the clipboard, which
+            // is what Finder pastes.
+            delegate.e2e_select(&[0, 1]);
+            delegate.e2e_copy_images();
+            let types = delegate.e2e_pasteboard_types();
+            check(
+                state,
+                types.iter().any(|t| t == "public.file-url"),
+                "copy puts file URLs on the clipboard, the way Finder does",
+            );
+            check(
+                state,
+                delegate.e2e_status_text() == "Copied 2 images",
+                "the status bar counts what was copied",
+            );
+            delegate.e2e_select(&[0]);
+            delegate.e2e_copy_images();
+            check(
+                state,
+                delegate.e2e_status_text().starts_with("Copied ")
+                    && delegate.e2e_status_text().ends_with(".heic"),
+                "one image is named instead of counted",
+            );
+        }
+        79 => {
+            // A zoomed slide asks for a decode that carries the
+            // file's own pixels. apple.heic is 512 px; the harness
+            // caps slide decodes at 256.
+            delegate.start_slideshow(0);
+        }
+        80 => {
+            let Some(view) = delegate.e2e_slide_view() else {
+                check(state, false, "slide view for the decode test");
+                return;
+            };
+            check(
+                state,
+                view.decoded_long_edge() <= 256.0,
+                "the first decode is the one that fits the screen",
+            );
+            view.zoom_to(2.0, None);
+        }
+        81 => {
+            let Some(view) = delegate.e2e_slide_view() else {
+                check(state, false, "slide view after the zoom");
+                return;
+            };
+            // The decode arrives on its own thread; give it a tick.
+            if view.decoded_long_edge() <= 256.0 && hold(state, 4) {
+                return;
+            }
+            check(
+                state,
+                view.decoded_long_edge() >= 512.0,
+                "zooming in brings a decode with the file's own pixels",
+            );
+            check(
+                state,
+                view.state().zoom == Some(2.0) && view.state().offset == (0.0, 0.0),
+                "the bigger decode changes the sharpness, not the view",
+            );
+            delegate.end_slideshow();
+        }
+        82 => {
+            // A second slideshow takes the place of the first one.
+            delegate.start_slideshow(0);
+            delegate.start_slideshow(1);
+            check(
+                state,
+                delegate.e2e_slideshow_windows() == 1,
+                "a second slideshow leaves one slideshow window",
+            );
+            check(
+                state,
+                delegate.e2e_show_is_windowed() == Some(true)
+                    && delegate.e2e_current_index() == Some(1),
+                "the second slideshow is the one on screen",
+            );
+            check(
+                state,
+                !delegate.e2e_menu_enabled(objc2::sel!(startSlideshow:)),
+                "Start Slideshow is disabled during a slideshow",
+            );
+            delegate.end_slideshow();
+        }
+        83 => {
+            check(
+                state,
+                delegate.e2e_slideshow_windows() == 0,
+                "ending the slideshow leaves no slideshow window",
+            );
+            check(
+                state,
+                delegate.e2e_menu_enabled(objc2::sel!(startSlideshow:)),
+                "Start Slideshow is enabled after the slideshow",
+            );
+        }
+        84 => {
+            // A pan or a pinch redraws the overlay on every event. The
+            // file header is read once, not once per event.
+            delegate.start_slideshow(0);
+            delegate.e2e_toggle_exif_overlay();
+        }
+        85 => {
+            if !delegate.e2e_slide_has_image() && hold(state, 4) {
+                return;
+            }
+            let Some(view) = delegate.e2e_slide_view() else {
+                check(state, false, "slide view for the header test");
+                return;
+            };
+            let before = delegate.e2e_header_reads();
+            for zoom in [1.5, 2.0, 3.0, 1.5, 2.0] {
+                view.zoom_to(zoom, None);
+            }
+            check(
+                state,
+                delegate.e2e_header_reads() == before,
+                "zooming does not read the file header again",
+            );
+            check(
+                state,
+                delegate
+                    .e2e_overlay_text()
+                    .is_some_and(|text| text.contains("Dimensions")),
+                "the EXIF block is still on the overlay",
+            );
+            delegate.e2e_toggle_exif_overlay();
+            delegate.end_slideshow();
+        }
+        86 => {
+            // A file that grows on disk: the sizes the grid keeps
+            // follow it.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let copied = std::fs::copy(format!("{root}/img2.heic"), grow_path(&root)).is_ok();
+            check(state, copied, "growing test file copied");
+        }
+        87 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            use std::io::Write;
+            let grown = std::fs::OpenOptions::new()
+                .append(true)
+                .open(grow_path(&root))
+                .and_then(|mut file| file.write_all(&[0; 5000]))
+                .is_ok();
+            check(state, grown, "test file grown on disk");
+        }
+        88 => {
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let size = |path: String| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let grown = blickli_core::messages::format_bytes(size(grow_path(&root)));
+            // Name order puts the zzz file last: index 4.
+            delegate.e2e_select(&[4]);
+            if !delegate.e2e_status_text().contains(&grown) && hold(state, 4) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_status_text().contains(&grown),
+                "the status bar shows the new size",
+            );
+            delegate.e2e_select(&[3, 4]);
+            // Natural name order: index 3 is img10.heic.
+            let both = blickli_core::messages::format_bytes(
+                size(format!("{root}/img10.heic")) + size(grow_path(&root)),
+            );
+            check(
+                state,
+                delegate.e2e_info_text().contains(&both),
+                "the info panel adds up the new size",
+            );
+            let _ = std::fs::remove_file(grow_path(&root));
+        }
+        89 => {
+            if wait_for_count(state, delegate, 4) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "grid back to the fixture",
+            );
+        }
+        90 => {
+            // Paste copies the files on the clipboard into the folder
+            // on screen. The item fires through the menu, the way a
+            // click does, so the nil-target `paste:` is what is tested.
+            delegate.e2e_select(&[0, 1]);
+            delegate.e2e_copy_images();
+            check(
+                state,
+                perform_menu_item("Edit", "Paste"),
+                "the Edit menu has a Paste item",
+            );
+        }
+        91 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            check(
+                state,
+                delegate.e2e_file_count() == 6,
+                "two pasted copies joined the grid",
+            );
+            check(
+                state,
+                std::path::Path::new(&format!("{root}/apple 2.heic")).exists()
+                    && std::path::Path::new(&format!("{root}/img1 2.heic")).exists(),
+                "a taken name keeps both files, Finder style",
+            );
+            let folder = std::path::Path::new(&root)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            check(
+                state,
+                delegate.e2e_status_text() == format!("Copied 2 images to {folder}, 2 renamed"),
+                "the status bar counts the paste",
+            );
+            check(
+                state,
+                delegate.e2e_undo_title() == "Undo copy",
+                "the paste is one undo",
+            );
+            delegate.e2e_undo();
+        }
+        92 => {
+            if wait_for_count(state, delegate, 4) {
+                return;
+            }
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "undo took both copies back",
+            );
+            check(
+                state,
+                !std::path::Path::new(&format!("{root}/apple 2.heic")).exists()
+                    && !std::path::Path::new(&format!("{root}/img1 2.heic")).exists(),
+                "the copies left the folder",
+            );
+        }
+        93 => {
+            // A copy into a folder that will not take files says why,
+            // not just how many.
+            use std::os::unix::fs::PermissionsExt;
+            let locked = locked_folder();
+            let made = std::fs::create_dir_all(&locked).is_ok()
+                && std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
+                    .is_ok();
+            check(state, made, "a read-only target folder is ready");
+            delegate.e2e_select(&[0]);
+            delegate.e2e_transfer(&locked, false);
+        }
+        94 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let locked = locked_folder();
+            let name = std::path::Path::new(&locked)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            check(
+                state,
+                delegate.e2e_status_text()
+                    == format!("Nothing copied to {name}, 1 failed: Permission denied"),
+                "the status bar says why the copy failed",
+            );
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "the failed copy left the grid alone",
+            );
+            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&locked);
+        }
+        _ => {
+            let failures = state.borrow().failures.clone();
+            if failures.is_empty() {
+                println!("e2e: PASS ({} steps)", step + 1);
+                std::process::exit(0);
+            }
+            println!("e2e: FAIL");
+            for f in &failures {
+                println!("  {f}");
+            }
+            std::process::exit(1);
+        }
+    }
+    let mut state = state.borrow_mut();
+    state.held = 0;
+    state.step += 1;
+}
+
+// ---- state peeks and pokes for the harness ----
+
+impl AppDelegate {
+    pub fn e2e_header_reads(&self) -> usize {
+        self.ivars().header_reads.get()
+    }
+
+    pub fn e2e_state(&self) -> &RefCell<e2e::E2eState> {
+        &self.ivars().e2e
+    }
+
+    pub fn e2e_file_count(&self) -> usize {
+        self.ivars()
+            .grid
+            .get()
+            .map(|g| g.ivars().files.borrow().len())
+            .unwrap_or(0)
+    }
+
+    pub fn e2e_show_active(&self) -> bool {
+        self.ivars().show.borrow().is_some()
+    }
+
+    /// How many slideshow windows are on screen.
+    pub fn e2e_slideshow_windows(&self) -> usize {
+        NSApplication::sharedApplication(self.mtm())
+            .windows()
+            .iter()
+            .filter(|window| window.isVisible() && window.isKindOfClass(SlideshowWindow::class()))
+            .count()
+    }
+
+    /// Whether the menu would enable an item with this action.
+    pub fn e2e_menu_enabled(&self, action: objc2::runtime::Sel) -> bool {
+        let item = menu_item(self.mtm(), ns_string!(""), action, ns_string!(""));
+        self.menu_item_enabled(&item)
+    }
+
+    pub fn e2e_current_index(&self) -> Option<usize> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.playlist.current_index())
+    }
+
+    pub fn e2e_slide_name(&self) -> Option<String> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.playlist.current().cloned())
+            .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+    }
+
+    pub fn e2e_slide_has_image(&self) -> bool {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.view.has_image())
+    }
+
+    pub fn e2e_slide_view(&self) -> Option<Retained<SlideView>> {
+        self.ivars().show.borrow().as_ref().map(|s| s.view.clone())
+    }
+
+    pub fn e2e_overlay_text(&self) -> Option<String> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.overlay.stringValue().to_string())
+    }
+
+    pub fn e2e_sort(&self, order: SortOrder, descending: bool) {
+        self.ivars().sort_order.set(order);
+        self.ivars().sort_desc.set(descending);
+        self.apply_sort();
+    }
+
+    pub fn e2e_first_file(&self) -> Option<String> {
+        self.ivars().grid.get().and_then(|g| {
+            g.paths()
+                .first()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+    }
+
+    pub fn e2e_grid_height(&self) -> f64 {
+        self.ivars()
+            .grid
+            .get()
+            .map(|g| g.frame().size.height)
+            .unwrap_or(0.0)
+    }
+
+    /// Key equivalents shared by two menu items.
+    pub fn e2e_menu_conflicts(&self) -> Vec<String> {
+        fn walk(
+            menu: &NSMenu,
+            seen: &mut HashMap<(String, usize), String>,
+            clashes: &mut Vec<String>,
+        ) {
+            for item in menu.itemArray() {
+                let key = item.keyEquivalent().to_string();
+                if !key.is_empty() {
+                    let mask = item.keyEquivalentModifierMask().bits();
+                    let title = item.title().to_string();
+                    match seen.get(&(key.clone(), mask)) {
+                        // The same entry twice is one shortcut, not a
+                        // clash: a hidden twin catches the shifted
+                        // press of the same key.
+                        Some(held) if *held == title => {}
+                        Some(held) => clashes.push(format!("{key} ({mask}): {held} and {title}")),
+                        None => {
+                            seen.insert((key, mask), title);
+                        }
+                    }
+                }
+                if let Some(submenu) = item.submenu() {
+                    walk(&submenu, seen, clashes);
+                }
+            }
+        }
+        let mtm = self.mtm();
+        let Some(menubar) = NSApplication::sharedApplication(mtm).mainMenu() else {
+            return Vec::new();
+        };
+        let mut seen = HashMap::new();
+        let mut clashes = Vec::new();
+        walk(&menubar, &mut seen, &mut clashes);
+        clashes
+    }
+
+    pub fn e2e_copy_images(&self) {
+        self.copy_images_to_clipboard();
+    }
+
+    /// The types the clipboard is carrying, for the harness.
+    pub fn e2e_pasteboard_types(&self) -> Vec<String> {
+        crate::file_ops::image_pasteboard()
+            .types()
+            .map(|types| types.iter().map(|t| t.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_toggle_scale_up(&self) {
+        self.toggle_scale_up_small();
+    }
+
+    pub fn e2e_scale_up(&self) -> bool {
+        self.ivars().scale_up_small.get()
+    }
+
+    /// How big the slide is drawn, as a fraction of its own size.
+    pub fn e2e_slide_scale(&self) -> f64 {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|show| show.view.drawn_scale())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_toggle_drag_copies(&self) {
+        self.toggle_drag_out_copies();
+    }
+
+    pub fn e2e_drag_copies(&self) -> bool {
+        self.ivars().drag_out_copies.get()
+    }
+
+    pub fn e2e_thumb_cap(&self, cap: f64) {
+        self.apply_thumb_cap(cap);
+    }
+
+    pub fn e2e_thumb_size(&self) -> f64 {
+        self.ivars()
+            .grid
+            .get()
+            .map(|grid| grid.cell_size())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_slider_value(&self) -> f64 {
+        self.ivars()
+            .thumb_slider
+            .get()
+            .map(|slider| slider.doubleValue())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_scale_cells(&self, factor: f64) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.scale_cells(factor);
+        }
+    }
+
+    pub fn e2e_select(&self, indices: &[usize]) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.e2e_set_selected(indices);
+        }
+    }
+
+    pub fn e2e_start_from_selection(&self) {
+        self.start_from_grid();
+    }
+
+    pub fn e2e_show_is_windowed(&self) -> Option<bool> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.window.styleMask().contains(NSWindowStyleMask::Titled))
+    }
+
+    pub fn e2e_playlist_len(&self) -> Option<usize> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.playlist.len())
+    }
+
+    pub fn e2e_status_text(&self) -> String {
+        self.ivars()
+            .status
+            .get()
+            .map(|s| s.stringValue().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Mirror a sidebar click on `path`: open the tree down to it and
+    /// run the same handler the selection callback runs.
+    pub fn e2e_sidebar_click(&self, path: &str) {
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.e2e_click(std::path::Path::new(path));
+        }
+    }
+
+    pub fn e2e_sidebar_path(&self) -> String {
+        self.ivars()
+            .sidebar
+            .get()
+            .and_then(|s| s.selected_path())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_sidebar_hidden(&self) -> bool {
+        self.ivars()
+            .split
+            .get()
+            .and_then(|split| {
+                split
+                    .splitViewItems()
+                    .firstObject()
+                    .map(|i| i.isCollapsed())
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn e2e_toggle_sidebar(&self) {
+        self.toggle_sidebar();
+    }
+
+    pub fn e2e_add_favorite(&self, path: &str) {
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.add_favorite(std::path::Path::new(path));
+        }
+    }
+
+    pub fn e2e_remove_favorite(&self, path: &str) {
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.remove_favorite(std::path::Path::new(path));
+        }
+    }
+
+    /// Titles, levels and front-to-back order of the app's windows,
+    /// so the harness can see what covers what.
+    pub fn e2e_window_order(&self) -> Vec<(String, isize, isize)> {
+        NSApplication::sharedApplication(self.mtm())
+            .windows()
+            .iter()
+            .filter(|window| window.isVisible())
+            .map(|window| {
+                (
+                    window.title().to_string(),
+                    window.level(),
+                    window.orderedIndex(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn e2e_slide_context_menu(&self) -> Vec<(String, bool)> {
+        let Some(menu) = self.slide_context_menu() else {
+            return Vec::new();
+        };
+        menu.update();
+        menu.itemArray()
+            .iter()
+            .map(|item| (item.title().to_string(), item.isEnabled()))
+            .collect()
+    }
+
+    pub fn e2e_grid_context_menu(&self, index: usize) -> Vec<(String, bool)> {
+        self.ivars()
+            .grid
+            .get()
+            .map(|grid| grid.e2e_context_menu(index))
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_sidebar_context_menu(&self, path: &str) -> Vec<String> {
+        self.ivars()
+            .sidebar
+            .get()
+            .map(|sidebar| sidebar.e2e_context_menu(std::path::Path::new(path)))
+            .unwrap_or_default()
+    }
+
+    /// Drop a folder into Favorites at `at`, the way a drag does.
+    pub fn e2e_insert_favorite(&self, path: &str, at: usize) {
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.insert_favorite(std::path::Path::new(path), at);
+        }
+    }
+
+    pub fn e2e_favorite_names(&self) -> Vec<String> {
+        self.ivars()
+            .sidebar
+            .get()
+            .map(|sidebar| {
+                sidebar
+                    .e2e_favorites()
+                    .iter()
+                    .filter_map(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_toggle_exif_overlay(&self) {
+        self.toggle_exif_overlay();
+    }
+
+    pub fn e2e_toggle_path_overlay(&self) {
+        self.toggle_path_overlay();
+    }
+
+    pub fn e2e_toggle_help_overlay(&self) {
+        self.toggle_help_overlay();
+    }
+
+    pub fn e2e_undo(&self) {
+        self.take_back(true);
+    }
+
+    pub fn e2e_redo(&self) {
+        self.take_back(false);
+    }
+
+    pub fn e2e_undo_title(&self) -> String {
+        self.ivars().history.borrow().undo_title()
+    }
+
+    pub fn e2e_redo_title(&self) -> String {
+        self.ivars().history.borrow().redo_title()
+    }
+
+    pub fn e2e_copy_path(&self, as_url: bool) {
+        self.copy_targets(as_url);
+    }
+
+    pub fn e2e_pasteboard_text(&self) -> String {
+        unsafe {
+            crate::file_ops::image_pasteboard().stringForType(objc2_app_kit::NSPasteboardTypeString)
+        }
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+    }
+
+    pub fn e2e_open_with_names(&self) -> Vec<String> {
+        self.open_with_menu(self.mtm())
+            .itemArray()
+            .iter()
+            .map(|item| item.title().to_string())
+            .collect()
+    }
+
+    pub fn e2e_info_text(&self) -> String {
+        self.info_text()
+    }
+
+    pub fn e2e_toggle_info(&self) {
+        self.toggle_info();
+    }
+
+    pub fn e2e_info_open(&self) -> bool {
+        self.ivars()
+            .info_window
+            .get()
+            .is_some_and(|window| window.isVisible())
+    }
+
+    pub fn e2e_favorite_count(&self) -> usize {
+        self.ivars()
+            .sidebar
+            .get()
+            .map(|s| s.e2e_favorites().len())
+            .unwrap_or(0)
+    }
+
+    /// The name of the first selected image, for selection checks.
+    pub fn e2e_selected_name(&self) -> Option<String> {
+        let first = self.ivars().grid.get()?.selection().first?;
+        first
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    }
+
+    /// Drive a move or a copy without the folder chooser.
+    pub fn e2e_transfer(&self, folder: &str, moving: bool) {
+        let kind = if moving {
+            Transfer::Move
+        } else {
+            Transfer::Copy
+        };
+        self.transfer_selection(PathBuf::from(folder), kind);
+    }
+
+    pub fn e2e_open_filter(&self) {
+        self.open_filter();
+    }
+
+    /// Esc, the same way the field hands it over.
+    pub fn e2e_close_filter(&self) {
+        self.filter_field_command(sel!(cancelOperation:));
+    }
+
+    /// Type into the field and let the delegate do the rest.
+    pub fn e2e_type_filter(&self, text: &str) {
+        if let Some(field) = self.ivars().filter_field.get() {
+            field.setStringValue(&NSString::from_str(text));
+        }
+        self.filter_changed();
+    }
+
+    pub fn e2e_filter_open(&self) -> bool {
+        self.ivars().filter_active.get()
+    }
+
+    pub fn e2e_select_all(&self) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.select_all();
+        }
+    }
+
+    pub fn e2e_transfer_busy(&self) -> bool {
+        self.ivars().transfer_busy.get()
+    }
+
+    pub fn e2e_repeat_item_title(&self, moving: bool) -> String {
+        let item = if moving {
+            self.ivars().move_again_item.get()
+        } else {
+            self.ivars().copy_again_item.get()
+        };
+        item.map(|i| i.title().to_string()).unwrap_or_default()
+    }
+
+    pub fn e2e_prefs_visible(&self) -> bool {
+        self.ivars()
+            .prefs_window
+            .get()
+            .is_some_and(|w| w.isVisible())
+    }
+
+    pub fn e2e_close_prefs(&self) {
+        if let Some(window) = self.ivars().prefs_window.get() {
+            window.close();
+        }
+    }
+
+    pub fn e2e_slide_animating(&self) -> bool {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.view.is_animating())
+    }
+
+    pub fn e2e_toggle_labels(&self) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.set_labels(!grid.labels_visible());
+        }
+    }
+}

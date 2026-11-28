@@ -1,0 +1,15 @@
+[package]
+name = "blickli-core"
+version = "0.1.1"
+edition = "2021"
+description = "Core folder scanning, sorting, history, and background decode engine for Blickli"
+license = "MIT"
+repository = "https://github.com/robchiral/Blickli"
+
+[dependencies]
+lexical-sort = "0.3"
+notify = "8"
+rand = { version = "0.10", features = ["unbiased"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

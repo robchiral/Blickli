@@ -1,0 +1,13 @@
+/target/
+.DS_Store
+.env
+config.env
+
+# The icon set is the only branding kept in git.
+/branding/*
+!/branding/macos/
+/branding/macos/*
+!/branding/macos/AppIcon.appiconset/
+
+# Local Core AI model weights.
+/upscale/

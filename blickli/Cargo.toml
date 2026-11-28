@@ -1,0 +1,44 @@
+[package]
+name = "blickli"
+version = "0.1.1"
+edition = "2021"
+description = "Native macOS image browser, slideshow viewer, and on-device upscaler"
+license = "MIT"
+repository = "https://github.com/robchiral/Blickli"
+
+[features]
+e2e = []
+# Offscreen window snapshots; see src/snapshot.rs.
+snapshot = []
+
+[dependencies]
+blickli-core = { path = "../blickli-core" }
+color_quant = "1.1"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std", "block2", "objc2-core-foundation", "objc2-core-graphics", "objc2-quartz-core",
+  "NSAlert", "NSAnimation", "NSAppearance", "NSApplication", "NSAttributedString", "NSBezierPath",
+  "NSBitmapImageRep", "NSBox", "NSButton", "NSButtonCell", "NSCell",
+  "NSColor", "NSControl", "NSCursor", "NSDragging", "NSDraggingItem", "NSDraggingSession",
+  "NSEvent", "NSFont", "NSFontDescriptor", "NSGraphics", "NSGraphicsContext",
+  "NSImage", "NSImageRep", "NSImageView", "NSMenu", "NSMenuItem", "NSMenuToolbarItem", "NSOpenPanel",
+  "NSOutlineView", "NSPanel", "NSParagraphStyle", "NSPasteboard", "NSPasteboardItem",
+  "NSPopUpButton", "NSProgressIndicator", "NSResponder", "NSRunningApplication", "NSSavePanel", "NSScreen",
+  "NSScrollView", "NSSearchField", "NSSearchToolbarItem", "NSSegmentedCell", "NSSegmentedControl",
+  "NSSlider", "NSSplitView", "NSSplitViewController", "NSSplitViewItem",
+  "NSStringDrawing", "NSTableCellView", "NSTableColumn", "NSTableHeaderView",
+  "NSTableView", "NSText", "NSTextField", "NSTextFieldCell", "NSTextView", "NSToolbar",
+  "NSToolbarItem", "NSTrackingArea", "NSUserInterfaceItemIdentification", "NSView",
+  "NSViewController", "NSVisualEffectView", "NSWindow", "NSWindowRestoration", "NSWindowScripting", "NSWorkspace",
+] }
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-image-io = "0.3"
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+  "std", "objc2-core-foundation", "objc2-core-graphics", "CALayer", "CATransaction",
+  "CATransform3D",
+] }
+png = "0.17"
+webp = { version = "0.3", default-features = false }
+dispatch2 = "0.3"
